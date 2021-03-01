@@ -1,0 +1,162 @@
+---
+title: "RNAseq: Proyecto final"
+author: "Joel Rodriguez Herrera (joelrh-lcg)"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    df_print: paged
+---
+
+# Definir set de datos de trabajo
+```{r}
+library('recount3')
+rawData <- available_projects()
+rawData
+```
+Se ha elegido el set de datos correspondiente al experimento SRP075318 que busca determinar los genes clave
+involucrados en la espermatogénesis con el fin de poder mejorar el diagnóstico y tratamiento de la infertilidad
+masculina ocasionada por desordenes de la espermatogénesis.
+
+Más información en: https://www.refine.bio/experiments/SRP075318/homo-sapiens-transcriptome-or-gene-expression
+
+# Extracción de datos
+
+```{r}
+proj_info <- subset(
+    rawData,
+    project == "SRP075318" & project_type == "data_sources"
+)
+rse_gene_SRP075318 <- create_rse(proj_info)
+rse_gene_SRP075318
+```
+Obteneos la cuenta de lecturas a partir de la cuentas de nucleotidos:
+```{r}
+assay(rse_gene_SRP075318, "counts") <- compute_read_counts(rse_gene_SRP075318)
+rse_gene_SRP075318
+```
+En el estudio se consideran 63,856 genes en 12 muestras.
+
+## Revision de datos extraídos
+
+```{r}
+rowData(rse_gene_SRP075318)
+```
+Revisamos que los atributos de las muestras sean uniformes para que no haya muestras con atibutos distintos.
+
+```{r}
+rse_gene_SRP075318$sra.sample_attributes[1:5]
+```
+
+```{r}
+rse_gene_SRP075318 <- expand_sra_attributes(rse_gene_SRP075318)
+colData(rse_gene_SRP075318)[
+    ,
+    grepl("^sra_attribute", colnames(colData(rse_gene_SRP075318)))
+]
+```
+
+Vemos que algunos de los datos no corresponden con el tipo de dato que deberían de ser, debemos hacer una corrección.
+
+```{r}
+colData(rse_gene_SRP075318)[1,]
+```
+Vemos que tenemos 187 columnas de información sobre cada gen.
+
+# Trabajo sobre los datos: limpieza y normalización
+
+## Corrección de tipo de datos
+
+En este caso solo es necesario corregir la edad, ya que los demás atributos como el sexo o el tejido son iguales para cada muestra
+```{r}
+rse_gene_SRP075318$sra_attribute.age <- as.numeric(rse_gene_SRP075318$sra_attribute.age)
+```
+
+
+```{r}
+# tenemos aislados para diferentes etapas de la espermatogénesis
+table(rse_gene_SRP075318$sra_attribute.isolate)
+```
+```{r}
+rse_gene_SRP075318$assigned_gene_prop <- rse_gene_SRP075318$recount_qc.gene_fc_count_all.assigned / rse_gene_SRP075318$recount_qc.gene_fc_count_all.total
+summary(rse_gene_SRP075318$assigned_gene_prop)
+```
+```{r}
+with(colData(rse_gene_SRP075318), plot(assigned_gene_prop, sra_attribute.age))
+```
+Vemos que no existe una co-relación evidente.
+
+Veamos las diferencias entre aislados:
+```{r}
+with(colData(rse_gene_SRP075318), tapply(assigned_gene_prop, sra_attribute.isolate, summary))
+```
+```{r}
+## Guardemos nuestro objeto entero por si luego cambiamos de opinión
+rse_gene_SRP075318_unfiltered <- rse_gene_SRP075318
+
+## Eliminemos a muestras malas
+hist(rse_gene_SRP075318$assigned_gene_prop)
+abline(v=0.5, col='red')
+```
+```{r}
+rse_gene_SRP075318 <- rse_gene_SRP075318[, rse_gene_SRP075318$assigned_gene_prop >= 0.5]
+rse_gene_SRP075318 
+```
+
+```{r}
+gene_means <- rowMeans(assay(rse_gene_SRP075318 , "counts"))
+summary(gene_means)
+```
+
+Procedemos a limpiar los genes poco informativos:
+```{r}
+## Eliminamos genes
+rse_gene_SRP075318 <- rse_gene_SRP075318[gene_means > 0.22, ]
+
+## Dimensiones finales
+dim(rse_gene_SRP075318)
+```
+```{r}
+## Porcentaje de genes que retuvimos
+round(nrow(rse_gene_SRP075318) / nrow(rse_gene_SRP075318_unfiltered) * 100, 2)
+```
+
+
+## Normalización
+
+```{r}
+library("edgeR")
+
+dge <- DGEList(
+    counts = assay(rse_gene_SRP075318, "counts"),
+    genes = rowData(rse_gene_SRP075318)
+)
+dge <- calcNormFactors(dge)
+```
+
+# Análisis de expresión diferencial
+
+```{r}
+library("ggplot2")
+ggplot(as.data.frame(colData(rse_gene_SRP075318)), aes(y = assigned_gene_prop, x = sra_attribute.isolate)) +
+    geom_boxplot() +
+    theme_bw(base_size = 20) +
+    ylab("Assigned Gene Prop") +
+    xlab("Isolate")
+```
+
+
+```{r}
+mod <- model.matrix(~ sra_attribute.isolate + sra_attribute.age,
+    data = colData(rse_gene_SRP075318)
+)
+colnames(mod)
+```
+```{r warning=TRUE}
+library("limma")
+vGene <- voom(dge, mod, plot = TRUE)
+```
+
+Debido a que el experimento no tiene replicaciones (cada aislado corresponde a 1 muestra) no podemos aplicar análisis con limma.
+
